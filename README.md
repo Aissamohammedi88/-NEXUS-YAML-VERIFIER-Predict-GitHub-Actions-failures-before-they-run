@@ -1,0 +1,2 @@
+# -NEXUS-YAML-VERIFIER-Predict-GitHub-Actions-failures-before-they-run
+Real test for GitHub Actions workflows. Reads your YAML, checks structure, runs the logic, and tells you: SUCCESS or FAIL — before you push. Detects syntax errors, missing deps, wrong runners, exposed secrets Real execution test (not simulation) Duration report in ms HMAC-SHA256 signed. SQLite audit. Live dashboard. Built by Aissa Mohammedi Nexus 
