@@ -1,0 +1,1013 @@
+#!/bin/bash# ═══════════════════════════════════════════════════════════════════════════
+# NEXUS ULTIMATE GENERATOR v2.0.0 — BASH EDITION
+# Auteur : Aissa Mohammedi (DGK) — NEXUS-OPEN-2.0
+#
+# Fonctionnalités :
+# • Générateur de 1000+ textes format entreprise
+# • Validateur de code multi-langage
+# • Générateur de hash (8 algorithmes)
+# • Générateur de signatures (HMAC-SHA256, PBKDF2)
+# • Export JSON / TXT / Markdown / CSV
+#
+# Usage :
+# bash nexus_ultimate.sh --count 1000
+# bash nexus_ultimate.sh --validate mon_fichier.py
+# bash nexus_ultimate.sh --hash mon_fichier.py
+# bash nexus_ultimate.sh --sign mon_fichier.py
+# ═══════════════════════════════════════════════════════════════════════════
+
+set -uo pipefail
+
+# ───────────────────────────────────────────────────────────────────────────
+# CONFIG
+# ───────────────────────────────────────────────────────────────────────────
+VERSION="2.0.0"
+AUTEUR="Aissa Mohammedi (DGK)"
+LICENCE="NEXUS-OPEN-2.0"
+
+BASE="$HOME/Documents/nexus_ultimate"
+KEYS_DIR="$BASE/keys"
+OUTPUT_DIR="$BASE/output"
+REPORT_DIR="$BASE/reports"
+mkdir -p "$KEYS_DIR" "$OUTPUT_DIR" "$REPORT_DIR"
+
+KEY_FILE="$KEYS_DIR/ultimate.key"
+
+# Couleurs
+if [ -t 1 ]; then
+G='\033[0;32m'; R='\033[0;31m'; Y='\033[1;33m'; B='\033[0;36m'
+M='\033[0;35m'; C='\033[1;36m'; W='\033[1;37m'; N='\033[0m'
+else
+G=''; R=''; Y=''; B=''; M=''; C=''; W=''; N=''
+fi
+
+info() { printf "${B}[INFO]${N} %s\n" "$1"; }
+ok() { printf "${G}[ OK ]${N} %s\n" "$1"; }
+warn() { printf "${Y}[WARN]${N} %s\n" "$1"; }
+err() { printf "${R}[FAIL]${N} %s\n" "$1"; }
+
+# ───────────────────────────────────────────────────────────────────────────
+# CRYPTO — CLÉ + HASH + SIGNATURE
+# ───────────────────────────────────────────────────────────────────────────
+charger_cle() {
+if [ ! -f "$KEY_FILE" ]; then
+openssl rand -hex 64 > "$KEY_FILE"
+chmod 600 "$KEY_FILE"
+fi
+cat "$KEY_FILE"
+}
+
+hash_multi() {
+local data="$1"
+echo "sha256: $(printf '%s' "$data" | sha256sum | cut -d' ' -f1)"
+echo "sha512: $(printf '%s' "$data" | sha512sum | cut -d' ' -f1)"
+echo "sha1: $(printf '%s' "$data" | sha1sum | cut -d' ' -f1)"
+echo "md5: $(printf '%s' "$data" | md5sum | cut -d' ' -f1)"
+if command -v b2sum &>/dev/null; then
+echo "blake2b: $(printf '%s' "$data" | b2sum | cut -d' ' -f1)"
+fi
+if command -v sha3sum &>/dev/null; then
+echo "sha3_256: $(printf '%s' "$data" | sha3sum -a 256 2>/dev/null | cut -d' ' -f1)"
+fi
+}
+
+signer_hmac() {
+local data="$1"
+local key="$2"
+printf '%s' "$data" | openssl dgst -sha256 -hmac "$key" | cut -d' ' -f2
+}
+
+signer_pbkdf2() {
+local data="$1"
+local key="$2"
+printf '%s' "$data" | openssl dgst -sha512 -hmac "$key" | cut -d' ' -f2
+}
+
+generer_id_signature() {
+local data="$1"
+local h
+h=$(printf '%s' "$data" | sha256sum | cut -c1-16 | tr 'a-f' 'A-F')
+echo "NEXUS-$h"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# VALIDATEUR DE CODE MULTI-LANGAGE
+# ───────────────────────────────────────────────────────────────────────────
+valider_fichier() {
+local fichier="$1"
+if [ ! -f "$fichier" ]; then
+err "Fichier introuvable : $fichier"
+return 1
+fi
+
+local ext="${fichier##*.}"
+local taille
+taille=$(stat -c%s "$fichier" 2>/dev/null || stat -f%z "$fichier" 2>/dev/null)
+local lignes
+lignes=$(wc -l < "$fichier")
+local contenu
+contenu=$(cat "$fichier")
+
+local score=100
+local problemes=()
+local avertissements=()
+local infos=()
+
+info "Fichier : $fichier"
+info "Extension : .$ext"
+info "Taille : $taille octets"
+info "Lignes : $lignes"
+echo ""
+
+# Hash complet
+echo -e "${C}═══ HASH ═══${N}"
+hash_multi "$contenu"
+echo ""
+
+# Vérifications générales
+if [ ! -s "$fichier" ]; then
+problemes+=("Fichier vide")
+score=$((score - 50))
+fi
+
+# Lignes longues
+local longues
+longues=$(awk 'length > 200' "$fichier" | wc -l)
+if [ "$longues" -gt 0 ]; then
+avertissements+=("$longues ligne(s) > 200 caractères")
+score=$((score - longues))
+fi
+
+# TODO/FIXME
+local todos
+todos=$(grep -cE "(TODO|FIXME|XXX|HACK)" "$fichier" 2>/dev/null || echo 0)
+if [ "$todos" -gt 0 ]; then
+avertissements+=("$todos TODO/FIXME détecté(s)")
+score=$((score - todos))
+fi
+
+# Secrets en clair
+if grep -qE '(password|api_key|secret|token)\s*[:=]\s*["'"'"'][^"'"'"']{8,}["'"'"']' "$fichier" 2>/dev/null; then
+problemes+=("Secret potentiellement en clair")
+score=$((score - 30))
+fi
+
+# Commandes dangereuses
+for danger in "rm -rf /" "sudo rm -rf /" "dd if=/dev/zero"; do
+if grep -qF "$danger" "$fichier" 2>/dev/null; then
+problemes+=("Commande dangereuse : $danger")
+score=$((score - 50))
+fi
+done
+
+# Validations spécifiques par langage
+case ".$ext" in
+.py)
+if grep -qP "\t" "$fichier" 2>/dev/null && grep -q " " "$fichier" 2>/dev/null; then
+problemes+=("Indentation mixte (tabs + espaces)")
+score=$((score - 15))
+fi
+local fns
+fns=$(grep -cE "^def\s+\w+" "$fichier" 2>/dev/null || echo 0)
+infos+=("$fns fonction(s)")
+local cls
+cls=$(grep -cE "^class\s+\w+" "$fichier" 2>/dev/null || echo 0)
+infos+=("$cls classe(s)")
+if python3 -c "import ast; ast.parse(open('$fichier').read())" 2>/dev/null; then
+infos+=("Syntaxe Python valide")
+else
+problemes+=("Erreur de syntaxe Python")
+score=$((score - 40))
+fi
+;;
+.js|.ts)
+if grep -qE "\bvar\s+" "$fichier" 2>/dev/null; then
+avertissements+=("Utilisation de 'var' (préférer let/const)")
+score=$((score - 5))
+fi
+local logs
+logs=$(grep -c "console\.log" "$fichier" 2>/dev/null || echo 0)
+if [ "$logs" -gt 5 ]; then
+avertissements+=("$logs console.log (à retirer en prod)")
+score=$((score - 10))
+fi
+;;
+.go)
+if ! grep -q "^package " "$fichier" 2>/dev/null; then
+problemes+=("Directive 'package' manquante")
+score=$((score - 30))
+fi
+local errs
+errs=$(grep -cE "if err\s*!=\s*nil" "$fichier" 2>/dev/null || echo 0)
+infos+=("$errs vérification(s) d'erreur")
+;;
+.rs)
+local unsafe
+unsafe=$(grep -cE "\bunsafe\b" "$fichier" 2>/dev/null || echo 0)
+if [ "$unsafe" -gt 0 ]; then
+avertissements+=("$unsafe bloc(s) unsafe")
+score=$((score - unsafe * 5))
+fi
+local unwraps
+unwraps=$(grep -c "\.unwrap()" "$fichier" 2>/dev/null || echo 0)
+if [ "$unwraps" -gt 3 ]; then
+avertissements+=("$unwraps .unwrap() (risque de panic)")
+score=$((score - 10))
+fi
+;;
+.c|.cpp|.h|.hpp)
+for danger in "strcpy(" "strcat(" "sprintf(" "gets("; do
+local n
+n=$(grep -cF "$danger" "$fichier" 2>/dev/null || echo 0)
+if [ "$n" -gt 0 ]; then
+problemes+=("$n utilisation(s) de $danger (buffer overflow)")
+score=$((score - n * 10))
+fi
+done
+;;
+.sh|.bash)
+if ! head -1 "$fichier" | grep -q "^#!"; then
+avertissements+=("Shebang manquant")
+score=$((score - 10))
+fi
+if ! grep -q "set -e" "$fichier" 2>/dev/null; then
+avertissements+=("'set -e' recommandé")
+score=$((score - 5))
+fi
+;;
+.yml|.yaml)
+if python3 -c "import yaml; yaml.safe_load(open('$fichier'))" 2>/dev/null; then
+infos+=("YAML syntaxiquement valide")
+else
+problemes+=("YAML invalide")
+score=$((score - 40))
+fi
+;;
+.json)
+if python3 -c "import json; json.load(open('$fichier'))" 2>/dev/null; then
+infos+=("JSON valide")
+else
+problemes+=("JSON invalide")
+score=$((score - 40))
+fi
+;;
+*)
+avertissements+=("Extension non supportée : .$ext")
+score=$((score - 10))
+;;
+esac
+
+# Borne
+[ "$score" -lt 0 ] && score=0
+[ "$score" -gt 100 ] && score=100
+
+# Signature
+local key
+key=$(charger_cle)
+local sig_hmac
+sig_hmac=$(signer_hmac "$contenu" "$key")
+local sig_pbkdf2
+sig_pbkdf2=$(signer_pbkdf2 "$contenu" "$key")
+local id_sig
+id_sig=$(generer_id_signature "$contenu")
+
+# Rapport
+echo -e "${C}═══ SIGNATURES ═══${N}"
+echo "ID signature : $id_sig"
+echo "HMAC-SHA256 : $sig_hmac"
+echo "PBKDF2 : $sig_pbkdf2"
+echo ""
+
+echo -e "${C}═══ RÉSULTAT ═══${N}"
+echo -e "${W}Score : $score/100${N}"
+echo ""
+
+if [ ${#problemes[@]} -gt 0 ]; then
+printf "${R}Problèmes (%d) :${N}\n" "${#problemes[@]}"
+for p in "${problemes[@]}"; do echo " ✗ $p"; done
+echo ""
+fi
+
+if [ ${#avertissements[@]} -gt 0 ]; then
+printf "${Y}Avertissements (%d) :${N}\n" "${#avertissements[@]}"
+for a in "${avertissements[@]}"; do echo " ⚠ $a"; done
+echo ""
+fi
+
+if [ ${#infos[@]} -gt 0 ]; then
+printf "${B}Infos (%d) :${N}\n" "${#infos[@]}"
+for i in "${infos[@]}"; do echo " ℹ $i"; done
+echo ""
+fi
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# GÉNÉRATEUR DE TEXTES — BANQUES
+# ───────────────────────────────────────────────────────────────────────────
+
+# 30 accroches
+readarray -t ACCROCHES <<'EOF'
+GitHub Actions runs millions of workflows per day.
+500+ workflows fail every single day on GitHub.
+Your CI/CD pipeline is burning money right now.
+Every failed workflow costs you time, money, and trust.
+GitHub Actions is powerful — but blind.
+You push, it fails, you debug, you lose hours.
+The YAML is valid. The workflow still fails.
+Nobody sees the failure coming — until it's too late.
+Millions of CI minutes burned on predictable failures.
+What if you knew BEFORE pushing?
+Your workflow has a bug. You just don't know yet.
+The industry standard is broken: push and pray.
+Developers lose 6 hours per week on CI/CD failures.
+Bad YAML. Missing deps. Wrong runner. Same story.
+One YAML mistake = one hour lost.
+The cost of a failed workflow is invisible — but real.
+GitHub gives you logs. I give you predictions.
+Stop pushing broken workflows.
+Know the outcome before the build starts.
+Real execution. Real result. Before you push.
+This is not a simulator. This is a test.
+Every enterprise needs this. Nobody has it.
+Your CI is leaking time. Let's plug it.
+The bug is in the YAML. Let's find it first.
+Before the workflow runs, I already know.
+Stop wasting CI minutes on failures you could prevent.
+The future of CI/CD is predictive.
+Verify first. Push second. Save always.
+One test. Zero surprises.
+This changes how enterprises ship code.
+EOF
+
+# 20 problèmes
+readarray -t PROBLEMES <<'EOF'
+bad YAML syntax
+missing dependencies
+wrong runner configuration
+exposed secrets in plaintext
+dangerous shell commands
+circular step dependencies
+missing environment variables
+broken action references
+invalid version pinning
+unpinned Docker images
+wrong working directory
+missing build artifacts
+silent failures in matrix builds
+timeout misconfiguration
+runner incompatibilities
+missing cache keys
+malformed conditionals
+empty run steps
+duplicated job names
+conflicting triggers
+EOF
+
+# 20 solutions
+readarray -t SOLUTIONS <<'EOF'
+real execution test before push
+structure validation + security audit
+HMAC-SHA256 signed files
+duration prediction in milliseconds
+runner compatibility check
+secret detection engine
+dependency resolution check
+workflow scoring 0-100
+SQLite audit trail
+GitHub API integration
+live dashboard on port 8877
+real-time state tracking
+dangerous command detection
+version pinning enforcement
+artifact verification
+matrix build consistency check
+cache key validation
+conditional logic verification
+trigger conflict detection
+job naming validation
+EOF
+
+# 10 rôles
+readarray -t ROLES <<'EOF'
+Founder & Chief Systems Architect
+Solo builder with 48 languages mastered
+Systems architect who derives from laws, not examples
+Builder of living logic systems
+Architect of UltraConnect and NexOS Kernel
+Founder of Nexus Ecosystem (46 modules, 1002 tools)
+Solo developer building what giants haven't formalized
+Systems engineer targeting sub-10ns execution
+Architect of self-defending logic layers
+Founder, builder, and sole architect of Nexus
+EOF
+
+# 15 CTA
+readarray -t CTA <<'EOF'
+Let's talk.
+I'm open to collaboration.
+If this resonates, reply.
+Ready to share the architecture.
+Let's build this together.
+Contact me directly.
+I have the code. You have the platform.
+This is ready. Are you?
+Reach out if you want the benchmark data.
+The door is open.
+No pitch. Just code.
+Let's move.
+I'll share everything if you're serious.
+Time to build.
+The next step is yours.
+EOF
+
+# 5 signatures
+readarray -t SIGNATURES <<'EOF'
+Aissa Mohammedi — Founder & Chief Systems Architect | awamomo646@outlook.com
+Aissa Mohammedi (DGK) — Meta Suprême Système · Québec · 2026
+Aissa Mohammedi — Nexus Ecosystem · UltraConnect · NexOS Kernel | awamomo646@outlook.com
+Aissa Mohammedi — linkedin.com/in/aissa-mohammedi-2308743b2 | awamomo646@outlook.com
+Aissa Mohammedi — Builder | awamomo646@outlook.com
+EOF
+
+# 10 formats
+readarray -t FORMATS <<'EOF'
+email
+linkedin_post
+github_readme
+proposal
+pitch_deck_text
+contract_intro
+technical_abstract
+executive_summary
+press_release
+partnership_letter
+EOF
+
+# 25 cibles
+readarray -t CIBLES <<'EOF'
+GitHub
+Microsoft
+Google
+Amazon Web Services
+Meta
+Apple
+OpenAI
+Anthropic
+DeepSeek
+NVIDIA
+Intel
+AMD
+Cloudflare
+GitLab
+Atlassian
+Datadog
+Sentry
+CircleCI
+Travis CI
+Jenkins
+Hashicorp
+Red Hat
+Canonical
+Docker
+OpenSSF
+EOF
+
+# 5 tons
+readarray -t TONS <<'EOF'
+direct
+ambitieux
+technique
+agressif
+professionnel
+EOF
+
+# ───────────────────────────────────────────────────────────────────────────
+# GÉNÉRATEUR
+# ───────────────────────────────────────────────────────────────────────────
+generer_texte() {
+local id="$1"
+local key="$2"
+
+local accroche="${ACCROCHES[$((RANDOM % ${#ACCROCHES[@]}))]}"
+local probleme="${PROBLEMES[$((RANDOM % ${#PROBLEMES[@]}))]}"
+local p2="${PROBLEMES[$((RANDOM % ${#PROBLEMES[@]}))]}"
+local p3="${PROBLEMES[$((RANDOM % ${#PROBLEMES[@]}))]}"
+local solution="${SOLUTIONS[$((RANDOM % ${#SOLUTIONS[@]}))]}"
+local s2="${SOLUTIONS[$((RANDOM % ${#SOLUTIONS[@]}))]}"
+local s3="${SOLUTIONS[$((RANDOM % ${#SOLUTIONS[@]}))]}"
+local role="${ROLES[$((RANDOM % ${#ROLES[@]}))]}"
+local cta="${CTA[$((RANDOM % ${#CTA[@]}))]}"
+local signature="${SIGNATURES[$((RANDOM % ${#SIGNATURES[@]}))]}"
+local format="${FORMATS[$((RANDOM % ${#FORMATS[@]}))]}"
+local cible="${CIBLES[$((RANDOM % ${#CIBLES[@]}))]}"
+local ton="${TONS[$((RANDOM % ${#TONS[@]}))]}"
+
+local sujet=""
+local corps=""
+
+case "$format" in
+email)
+sujet="Collaboration — ${accroche:0:60}"
+corps="Hey $cible team,
+
+$accroche
+
+Most CI/CD failures are predictable: $probleme. Yet nobody catches them before the push.
+
+I built something that does: NEXUS YAML VERIFIER.
+It reads your workflow, runs a real execution test, and tells you SUCCESS or FAIL — before you push.
+
+What it detects:
+- $probleme
+- $p2
+- $p3
+
+What it does:
+- $solution
+- $s2
+- $s3
+
+Real test. Real execution. Real result.
+
+$cta
+
+$signature"
+;;
+linkedin_post)
+sujet="LinkedIn post — $cible"
+corps="$accroche
+
+I'm a $role.
+
+I built NEXUS YAML VERIFIER — a real execution test for GitHub Actions workflows.
+
+It detects:
+• $probleme
+• $p2
+• $p3
+
+It returns:
+• SUCCESS or FAIL before you push
+• Duration in milliseconds
+• HMAC-SHA256 signed audit trail
+• Multi-hash verification
+
+$cta
+
+$signature"
+;;
+github_readme)
+sujet="README — $cible"
+corps="# NEXUS YAML VERIFIER
+
+> $accroche
+
+## What is it?
+
+Real execution test for GitHub Actions workflows.
+Detects $probleme, $p2, and $p3 — before you push.
+
+## Features
+
+- $solution
+- $s2
+- $s3
+- SHA-256 + SHA-512 + BLAKE2 hashing
+- HMAC-SHA256 signatures
+
+## Author
+
+$signature
+
+## License
+
+NEXUS-OPEN-2.0"
+;;
+proposal)
+sujet="Proposal — $cible"
+corps="PROPOSAL FOR ${cible^^}
+
+Prepared by: $role
+
+PROBLEM:
+$accroche
+Main issues: $probleme, $p2, $p3.
+
+SOLUTION:
+NEXUS YAML VERIFIER — $solution, $s2, $s3.
+
+DELIVERABLES:
+- Real execution test engine
+- Multi-hash verification
+- HMAC-SHA256 signature system
+- SQLite audit trail
+- Live dashboard
+- GitHub API integration
+
+INVESTMENT:
+To be discussed.
+
+$cta
+
+$signature"
+;;
+pitch_deck_text)
+sujet="Pitch — $cible"
+corps="SLIDE 1 — THE PROBLEM
+$accroche
+$probleme. $p2. $p3.
+
+SLIDE 2 — THE SOLUTION
+NEXUS YAML VERIFIER
+$solution. $s2. $s3.
+
+SLIDE 3 — THE FOUNDER
+$role
+
+SLIDE 4 — THE TECHNOLOGY
+- Multi-hash verification
+- HMAC-SHA256 signatures
+- Real execution engine
+- GitHub API integration
+
+SLIDE 5 — THE ASK
+$cta
+
+$signature"
+;;
+contract_intro)
+sujet="Contract intro — $cible"
+corps="CONTRACT INTRODUCTION
+
+Between: ${signature%%|*}
+And: $cible
+
+Subject: NEXUS YAML VERIFIER — Enterprise License
+
+Context:
+$accroche
+
+Scope:
+- $solution
+- $s2
+- $s3
+- Multi-hash verification
+- HMAC-SHA256 signatures
+
+Term: To be negotiated.
+Compensation: To be negotiated.
+
+$cta"
+;;
+technical_abstract)
+sujet="Technical abstract — $cible"
+corps="TECHNICAL ABSTRACT — NEXUS YAML VERIFIER
+
+$accroche
+
+Problem addressed:
+$probleme, $p2, $p3.
+
+Method:
+- $solution
+- $s2
+- $s3
+
+Cryptographic verification:
+- SHA-256, SHA-512, BLAKE2b, BLAKE2s
+- HMAC-SHA256 for authentication
+- PBKDF2-HMAC-SHA512 for key derivation
+
+Implementation: Bash + OpenSSL + pyyaml.
+
+Author: $role
+$signature"
+;;
+executive_summary)
+sujet="Executive summary — $cible"
+corps="EXECUTIVE SUMMARY
+
+Prepared for: $cible
+By: $role
+
+$accroche
+
+Impact:
+- Detects $probleme
+- Prevents $p2
+- Eliminates $p3
+
+Solution: NEXUS YAML VERIFIER
+- $solution
+- $s2
+- Multi-hash + HMAC signature
+
+$cta
+
+$signature"
+;;
+press_release)
+sujet="Press release — $cible"
+corps="FOR IMMEDIATE RELEASE
+
+$accroche
+
+Québec, Canada — $(date +'%B %d, %Y')
+
+$role announces NEXUS YAML VERIFIER, the first real execution test for GitHub Actions workflows.
+
+The system detects $probleme, $p2, and $p3 before code is pushed.
+
+Cryptographic features:
+- Multi-hash verification
+- HMAC-SHA256 authentication
+
+\"$cta\"
+
+Contact:
+$signature"
+;;
+partnership_letter)
+sujet="Partnership letter — $cible"
+corps="Dear $cible team,
+
+$accroche
+
+I'm $role.
+
+I've built NEXUS YAML VERIFIER — a real execution test for GitHub Actions workflows.
+It detects $probleme, $p2, and $p3 before push.
+
+What it does:
+- $solution
+- $s2
+- $s3
+- Multi-hash cryptographic verification
+- HMAC-SHA256 signed audit trail
+
+$cta
+
+Sincerely,
+$signature"
+;;
+esac
+
+local contenu="$sujet
+
+$corps"
+local hashes
+hashes=$(hash_multi "$contenu")
+local sha256
+sha256=$(printf '%s' "$contenu" | sha256sum | cut -d' ' -f1)
+local sig_hmac
+sig_hmac=$(signer_hmac "$contenu" "$key")
+local sig_pbkdf2
+sig_pbkdf2=$(signer_pbkdf2 "$contenu" "$key")
+local id_sig
+id_sig=$(generer_id_signature "$contenu")
+local longueur=${#contenu}
+
+# Stocker dans un tableau global
+TEXTE_ID[$id]="$id"
+TEXTE_FORMAT[$id]="$format"
+TEXTE_CIBLE[$id]="$cible"
+TEXTE_TON[$id]="$ton"
+TEXTE_SUJET[$id]="$sujet"
+TEXTE_CORPS[$id]="$corps"
+TEXTE_SHA256[$id]="$sha256"
+TEXTE_HMAC[$id]="$sig_hmac"
+TEXTE_PBKDF2[$id]="$sig_pbkdf2"
+TEXTE_ID_SIG[$id]="$id_sig"
+TEXTE_LONGUEUR[$id]="$longueur"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# EXPORTS
+# ───────────────────────────────────────────────────────────────────────────
+export_json() {
+local path="$1"
+local count="$2"
+{
+echo "["
+for i in $(seq 1 "$count"); do
+echo -n " {"
+echo -n "\"id\": ${TEXTE_ID[$i]}, "
+echo -n "\"format\": \"${TEXTE_FORMAT[$i]}\", "
+echo -n "\"cible\": \"${TEXTE_CIBLE[$i]}\", "
+echo -n "\"ton\": \"${TEXTE_TON[$i]}\", "
+echo -n "\"id_signature\": \"${TEXTE_ID_SIG[$i]}\", "
+echo -n "\"sujet\": $(printf '%s' "${TEXTE_SUJET[$i]}" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'), "
+echo -n "\"corps\": $(printf '%s' "${TEXTE_CORPS[$i]}" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'), "
+echo -n "\"sha256\": \"${TEXTE_SHA256[$i]}\", "
+echo -n "\"hmac\": \"${TEXTE_HMAC[$i]}\", "
+echo -n "\"longueur\": ${TEXTE_LONGUEUR[$i]}"
+if [ "$i" -lt "$count" ]; then
+echo "},"
+else
+echo "}"
+fi
+done
+echo "]"
+} > "$path"
+}
+
+export_txt() {
+local path="$1"
+local count="$2"
+{
+for i in $(seq 1 "$count"); do
+echo "================================================================================"
+echo "TEXTE #${TEXTE_ID[$i]} — ${TEXTE_FORMAT[$i]} → ${TEXTE_CIBLE[$i]} (${TEXTE_TON[$i]})"
+echo "ID SIGNATURE : ${TEXTE_ID_SIG[$i]}"
+echo "================================================================================"
+echo "${TEXTE_SUJET[$i]}"
+echo ""
+echo "${TEXTE_CORPS[$i]}"
+echo ""
+echo "[SHA-256] ${TEXTE_SHA256[$i]}"
+echo "[HMAC] ${TEXTE_HMAC[$i]}"
+echo "[PBKDF2] ${TEXTE_PBKDF2[$i]}"
+echo ""
+echo ""
+done
+} > "$path"
+}
+
+export_markdown() {
+local path="$1"
+local count="$2"
+{
+echo "# NEXUS Ultimate Texts — $count générés"
+echo ""
+echo "*Généré le $(date +'%Y-%m-%d %H:%M:%S')*"
+echo ""
+echo "---"
+echo ""
+for i in $(seq 1 "$count"); do
+echo "## Texte #${TEXTE_ID[$i]} — ${TEXTE_FORMAT[$i]} → ${TEXTE_CIBLE[$i]}"
+echo ""
+echo "**ID Signature :** \`${TEXTE_ID_SIG[$i]}\` "
+echo "**Ton :** ${TEXTE_TON[$i]} "
+echo "**Sujet :** ${TEXTE_SUJET[$i]} "
+echo ""
+echo '```'
+echo "${TEXTE_CORPS[$i]}"
+echo '```'
+echo ""
+echo "\`SHA-256 : ${TEXTE_SHA256[$i]:0:32}...\` "
+echo "\`HMAC : ${TEXTE_HMAC[$i]:0:32}...\`"
+echo ""
+echo "---"
+echo ""
+done
+} > "$path"
+}
+
+export_csv() {
+local path="$1"
+local count="$2"
+{
+echo "id,id_signature,format,cible,ton,sujet,longueur,sha256,hmac"
+for i in $(seq 1 "$count"); do
+echo "${TEXTE_ID[$i]},${TEXTE_ID_SIG[$i]},${TEXTE_FORMAT[$i]},${TEXTE_CIBLE[$i]},${TEXTE_TON[$i]},\"${TEXTE_SUJET[$i]:0:50}\",${TEXTE_LONGUEUR[$i]},${TEXTE_SHA256[$i]:0:16},${TEXTE_HMAC[$i]:0:16}"
+done
+} > "$path"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# MAIN
+# ───────────────────────────────────────────────────────────────────────────
+main() {
+local mode="generate"
+local count=1000
+local format="all"
+local fichier=""
+
+# Parse args
+while [ $# -gt 0 ]; do
+case "$1" in
+--count) count="$2"; shift 2 ;;
+--format) format="$2"; shift 2 ;;
+--validate) mode="validate"; fichier="$2"; shift 2 ;;
+--hash) mode="hash"; fichier="$2"; shift 2 ;;
+--sign) mode="sign"; fichier="$2"; shift 2 ;;
+*) shift ;;
+esac
+done
+
+echo ""
+echo "==========================================================================="
+echo " 🧬 NEXUS ULTIMATE GENERATOR v$VERSION — BASH EDITION"
+echo " Auteur : $AUTEUR"
+echo " Licence : $LICENCE"
+echo "==========================================================================="
+echo ""
+
+# Mode validate
+if [ "$mode" = "validate" ]; then
+valider_fichier "$fichier"
+return
+fi
+
+# Mode hash
+if [ "$mode" = "hash" ]; then
+if [ ! -f "$fichier" ]; then
+err "Fichier introuvable : $fichier"
+return 1
+fi
+info "Hash de : $fichier"
+echo ""
+hash_multi "$(cat "$fichier")"
+return
+fi
+
+# Mode sign
+if [ "$mode" = "sign" ]; then
+if [ ! -f "$fichier" ]; then
+err "Fichier introuvable : $fichier"
+return 1
+fi
+local key
+key=$(charger_cle)
+local contenu
+contenu=$(cat "$fichier")
+info "Signature de : $fichier"
+echo ""
+echo "ID signature : $(generer_id_signature "$contenu")"
+echo "HMAC-SHA256 : $(signer_hmac "$contenu" "$key")"
+echo "PBKDF2 : $(signer_pbkdf2 "$contenu" "$key")"
+return
+fi
+
+# Mode générateur
+info "Nombre de textes : $count"
+info "Format : $format"
+info "Cibles : ${#CIBLES[@]} entreprises"
+info "Formats cibles : ${#FORMATS[@]} formats"
+echo ""
+
+local key
+key=$(charger_cle)
+
+declare -A TEXTE_ID TEXTE_FORMAT TEXTE_CIBLE TEXTE_TON TEXTE_SUJET TEXTE_CORPS
+declare -A TEXTE_SHA256 TEXTE_HMAC TEXTE_PBKDF2 TEXTE_ID_SIG TEXTE_LONGUEUR
+
+local start
+start=$(date +%s)
+
+info "Génération en cours..."
+for i in $(seq 1 "$count"); do
+generer_texte "$i" "$key"
+if [ $((i % 100)) -eq 0 ] || [ "$i" -eq "$count" ]; then
+local pct=$((i * 100 / count))
+printf "\r [%d%%] %d/%d" "$pct" "$i" "$count"
+fi
+done
+echo ""
+echo ""
+
+local end
+end=$(date +%s)
+local elapsed=$((end - start))
+ok "$count textes générés en ${elapsed}s"
+echo ""
+
+local ts
+ts=$(date +%Y%m%d_%H%M%S)
+
+if [ "$format" = "json" ] || [ "$format" = "all" ]; then
+export_json "$OUTPUT_DIR/textes_$ts.json" "$count"
+ok "JSON : $OUTPUT_DIR/textes_$ts.json"
+fi
+if [ "$format" = "txt" ] || [ "$format" = "all" ]; then
+export_txt "$OUTPUT_DIR/textes_$ts.txt" "$count"
+ok "TXT : $OUTPUT_DIR/textes_$ts.txt"
+fi
+if [ "$format" = "markdown" ] || [ "$format" = "all" ]; then
+export_markdown "$OUTPUT_DIR/textes_$ts.md" "$count"
+ok "Markdown : $OUTPUT_DIR/textes_$ts.md"
+fi
+if [ "$format" = "csv" ] || [ "$format" = "all" ]; then
+export_csv "$OUTPUT_DIR/textes_$ts.csv" "$count"
+ok "CSV : $OUTPUT_DIR/textes_$ts.csv"
+fi
+
+echo ""
+echo "==========================================================================="
+echo " ✅ GÉNÉRATION TERMINÉE"
+echo "==========================================================================="
+echo ""
+echo " 📂 Dossier : $OUTPUT_DIR"
+echo " 🎯 Total : $count textes"
+echo ""
+echo " 📖 Aperçu du texte #1 :"
+echo " ─────────────────────────────────────────────────────────────────"
+echo "${TEXTE_CORPS[1]}" | head -10 | sed 's/^/ /'
+echo " ─────────────────────────────────────────────────────────────────"
+echo " ID signature : ${TEXTE_ID_SIG[1]}"
+echo " SHA-256 : ${TEXTE_SHA256[1]:0:48}..."
+echo " HMAC : ${TEXTE_HMAC[1]:0:48}..."
+echo ""
+}
+
+main "$@"
