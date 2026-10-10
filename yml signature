@@ -1,0 +1,2171 @@
+#!/usr/bin/env python3
+
+# -*- coding: utf-8 -*-
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# NEXUS YAML VERIFIER v4.0.0 — LIVE DASHBOARD + GITHUB API + RUNTIME TEST
+
+# Auteur : Aissa Mohammedi (DGK) — NEXUS-OPEN-2.0
+
+#
+
+# Fonctionnalités :
+
+#   • Dashboard HTTP live (port 8877)
+
+#   • API GitHub (repo, workflows, fichiers .yml)
+
+#   • Upload / coller un .yml → évaluation locale
+
+#   • Simulation runtime : combien de temps le workflow tient avant fail
+
+#   • Rapport de durée (ms), statut (OK/FAIL), cause du fail
+
+#   • Signature HMAC + SHA-256
+
+#   • Historique SQLite + export JSON/CSV
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+import os
+
+import re
+
+import io
+
+import sys
+
+import json
+
+import hmac
+
+import time
+
+import socket
+
+import secrets
+
+import argparse
+
+import sqlite3
+
+import hashlib
+
+import threading
+
+import traceback
+
+import subprocess
+
+import urllib.parse
+
+import urllib.request
+
+import urllib.error
+
+from pathlib import Path
+
+from datetime import datetime, timezone
+
+from collections import Counter
+
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+from socketserver import ThreadingMixIn
+
+
+
+try:
+
+    import yaml
+
+except ImportError:
+
+    print("[KO] pyyaml manquant : pip install pyyaml")
+
+    sys.exit(1)
+
+
+
+VERSION = "4.0.0"
+
+AUTEUR  = "Aissa Mohammedi (DGK)"
+
+LICENCE = "NEXUS-OPEN-2.0"
+
+HTTP_PORT = 8877
+
+
+
+BASE        = Path.home() / "Documents" / "nexus_yaml_verifier"
+
+KEYS_DIR    = BASE / "keys"
+
+REPORTS_DIR = BASE / "reports"
+
+DB_DIR      = BASE / "db"
+
+LOGS_DIR    = BASE / "logs"
+
+UPLOADS_DIR = BASE / "uploads"
+
+
+
+for d in (BASE, KEYS_DIR, REPORTS_DIR, DB_DIR, LOGS_DIR, UPLOADS_DIR):
+
+    d.mkdir(parents=True, exist_ok=True)
+
+
+
+KEY_FILE = KEYS_DIR / "signing.key"
+
+DB_FILE  = DB_DIR / "yaml_scan.db"
+
+LOG_FILE = LOGS_DIR / "verifier.log"
+
+
+
+STATE = {
+
+    "running": False,
+
+    "total": 0, "valides": 0, "invalides": 0, "workflows": 0,
+
+    "depot": "", "started": 0, "vitesse": 0.0, "eta": 0.0,
+
+    "limite": 0,
+
+    "last_files": [], "top_erreurs": [], "log": [],
+
+    "runs": [],
+
+}
+
+STATE_LK = threading.RLock()
+
+
+
+
+
+def state_update(**kw):
+
+    with STATE_LK:
+
+        STATE.update(kw)
+
+
+
+
+
+def state_get():
+
+    with STATE_LK:
+
+        return dict(STATE)
+
+
+
+
+
+def log_push(msg):
+
+    with STATE_LK:
+
+        STATE["log"].append({"ts": time.time(), "msg": str(msg)[:300]})
+
+        if len(STATE["log"]) > 300:
+
+            STATE["log"] = STATE["log"][-300:]
+
+
+
+
+
+LOG_LK = threading.RLock()
+
+
+
+
+
+def log(msg):
+
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    line = "[" + ts + "] " + str(msg)
+
+    try:
+
+        print(line, flush=True)
+
+    except Exception:
+
+        pass
+
+    log_push(msg)
+
+    with LOG_LK:
+
+        try:
+
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+
+                f.write(line + "\n")
+
+        except OSError:
+
+            pass
+
+
+
+
+
+if sys.stdout.isatty() and not os.environ.get("NO_COLOR"):
+
+    G = "\033[92m"; Y = "\033[93m"; R = "\033[91m"; B = "\033[94m"
+
+    C = "\033[96m"; M = "\033[95m"; W = "\033[1;37m"; D = "\033[2m"; N = "\033[0m"
+
+else:
+
+    G = Y = R = B = C = M = W = D = N = ""
+
+
+
+
+
+def ok(m):    log("  " + G + "[OK]" + N + " " + str(m))
+
+def warn(m):  log("  " + Y + "[!!]" + N + " " + str(m))
+
+def err(m):   log("  " + R + "[KO]" + N + " " + str(m))
+
+def info(m):  log("  " + B + "[i]" + N + " " + str(m))
+
+def sect(m):
+
+    log("")
+
+    log(C + "=" * 70 + N)
+
+    log(C + "  " + str(m) + N)
+
+    log(C + "=" * 70 + N)
+
+    log("")
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# SIGNATURE
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+def charger_ou_creer_cle():
+
+    if KEY_FILE.exists():
+
+        return KEY_FILE.read_bytes()
+
+    key = secrets.token_bytes(64)
+
+    KEY_FILE.write_bytes(key)
+
+    try:
+
+        os.chmod(KEY_FILE, 0o600)
+
+    except OSError:
+
+        pass
+
+    return key
+
+
+
+
+
+def signer(data, key):
+
+    return hmac.new(key, data, hashlib.sha256).hexdigest()
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# SQLITE
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+def init_db():
+
+    conn = sqlite3.connect(str(DB_FILE))
+
+    cur = conn.cursor()
+
+    cur.execute("PRAGMA journal_mode=WAL")
+
+    cur.execute("""
+
+        CREATE TABLE IF NOT EXISTS fichiers (
+
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            source TEXT, chemin TEXT UNIQUE, nom TEXT,
+
+            taille INTEGER, lignes INTEGER,
+
+            hash_sha256 TEXT, signature_hmac TEXT,
+
+            etat_verification TEXT,
+
+            valide_syntaxe INTEGER, erreur_syntaxe TEXT,
+
+            est_workflow INTEGER, score INTEGER,
+
+            probleme TEXT, avertissement TEXT, info TEXT,
+
+            duree_ms INTEGER DEFAULT 0,
+
+            run_statut TEXT DEFAULT '',
+
+            run_erreur TEXT DEFAULT '',
+
+            run_ms INTEGER DEFAULT 0,
+
+            date_scan TEXT
+
+        )
+
+    """)
+
+    cur.execute("""
+
+        CREATE TABLE IF NOT EXISTS runs (
+
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            source TEXT, chemin TEXT, nom TEXT,
+
+            contenu_hash TEXT, statut TEXT,
+
+            duree_ms INTEGER, erreur TEXT,
+
+            etapes_ok INTEGER, etapes_ko INTEGER,
+
+            date_run TEXT
+
+        )
+
+    """)
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_score ON fichiers(score)")
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_etat ON fichiers(etat_verification)")
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_run ON runs(statut)")
+
+    conn.commit()
+
+    conn.close()
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# PARSING YAML
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+def valider_yaml(contenu):
+
+    r = {"valide": False, "erreur": None, "data": None,
+
+         "taille": len(contenu), "lignes": contenu.count("\n") + 1}
+
+    try:
+
+        data = yaml.safe_load(contenu)
+
+        if data is None:
+
+            r["erreur"] = "Fichier vide"
+
+            return r
+
+        r["valide"] = True
+
+        r["data"] = data
+
+    except yaml.YAMLError as e:
+
+        m = getattr(e, "problem_mark", None)
+
+        if m:
+
+            r["erreur"] = "Ligne " + str(m.line + 1) + " col " + str(m.column + 1) + " : " + str(e.problem or e)[:160]
+
+        else:
+
+            r["erreur"] = str(e)[:200]
+
+    except Exception as e:
+
+        r["erreur"] = str(e)[:200]
+
+    return r
+
+
+
+
+
+def verifier_workflow(data):
+
+    """Vérifie la structure d'un GitHub Actions workflow."""
+
+    r = {"score": 100, "problemes": [], "avertissements": [], "infos": [],
+
+         "jobs": 0, "steps": 0}
+
+    if not isinstance(data, dict):
+
+        r["problemes"].append("Objet YAML attendu")
+
+        r["score"] = 0
+
+        return r
+
+    if "on" not in data:
+
+        r["problemes"].append("Section 'on' manquante")
+
+    if "jobs" not in data:
+
+        r["problemes"].append("Section 'jobs' manquante")
+
+        r["score"] = 0
+
+        return r
+
+    jobs = data.get("jobs", {})
+
+    if not isinstance(jobs, dict) or not jobs:
+
+        r["problemes"].append("Aucun job")
+
+        r["score"] = 0
+
+        return r
+
+    r["jobs"] = len(jobs)
+
+    for nom, job in jobs.items():
+
+        if not isinstance(job, dict):
+
+            r["problemes"].append("Job " + nom + " : objet attendu")
+
+            continue
+
+        if "runs-on" not in job:
+
+            r["problemes"].append("Job " + nom + " : 'runs-on' manquant")
+
+        steps = job.get("steps", [])
+
+        if not isinstance(steps, list) or not steps:
+
+            r["problemes"].append("Job " + nom + " : steps manquant")
+
+            continue
+
+        r["steps"] += len(steps)
+
+        for i, st in enumerate(steps):
+
+            if not isinstance(st, dict):
+
+                continue
+
+            if "uses" not in st and "run" not in st:
+
+                r["problemes"].append("Job " + nom + " step " + str(i) + " : 'uses' ou 'run' manquant")
+
+            if "uses" in st:
+
+                a = str(st["uses"])
+
+                if "@" not in a:
+
+                    r["avertissements"].append("Job " + nom + " step " + str(i) + " : version manquante (" + a + ")")
+
+            if "run" in st and isinstance(st["run"], str):
+
+                cmd = st["run"]
+
+                for d in ("rm -rf /", "sudo rm -rf /", "dd if=/dev/zero", ":(){:|:&};:"):
+
+                    if d in cmd:
+
+                        r["problemes"].append("Job " + nom + " step " + str(i) + " : dangereux (" + d + ")")
+
+                if re.search(r"(password|api_key|secret|token)\s*[:=]\s*['\"][^'\"]{8,}['\"]", cmd, re.I):
+
+                    r["avertissements"].append("Job " + nom + " step " + str(i) + " : secret en clair")
+
+    if "permissions" not in data:
+
+        r["avertissements"].append("Section 'permissions' manquante")
+
+    score = 100 - len(r["problemes"]) * 15 - len(r["avertissements"]) * 5
+
+    r["score"] = max(0, min(100, score))
+
+    return r
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# SIMULATION RUNTIME
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+def simuler_run(data):
+
+    """
+
+    Simule l'exécution d'un workflow GitHub Actions.
+
+    Retourne : statut, durée en ms, erreur, étapes OK/KO, log par étape.
+
+    """
+
+    t0 = time.time()
+
+    r = {
+
+        "statut": "SUCCESS",
+
+        "duree_ms": 0,
+
+        "erreur": "",
+
+        "etapes_ok": 0,
+
+        "etapes_ko": 0,
+
+        "log": [],
+
+    }
+
+    if not isinstance(data, dict):
+
+        r["statut"] = "FAIL"
+
+        r["erreur"] = "Structure YAML invalide"
+
+        r["duree_ms"] = int((time.time() - t0) * 1000)
+
+        return r
+
+
+
+    jobs = data.get("jobs", {})
+
+    if not isinstance(jobs, dict):
+
+        r["statut"] = "FAIL"
+
+        r["erreur"] = "Section 'jobs' invalide"
+
+        r["duree_ms"] = int((time.time() - t0) * 1000)
+
+        return r
+
+
+
+    for nom_job, job in jobs.items():
+
+        # Vérifie runs-on (compatibilité runner)
+
+        runs_on = job.get("runs-on", "")
+
+        if isinstance(runs_on, list):
+
+            runs_on = runs_on[0] if runs_on else ""
+
+        runs_on = str(runs_on).lower()
+
+        if runs_on and runs_on not in ("ubuntu-latest", "ubuntu-22.04",
+
+                                        "ubuntu-20.04", "ubuntu-24.04",
+
+                                        "macos-latest", "macos-14",
+
+                                        "windows-latest", "windows-2022",
+
+                                        "self-hosted"):
+
+            r["etapes_ko"] += 1
+
+            r["statut"] = "FAIL"
+
+            r["erreur"] = "Runner inconnu : " + str(runs_on)
+
+            r["log"].append("[FAIL] " + nom_job + " : runner " + str(runs_on) + " introuvable")
+
+            r["duree_ms"] = int((time.time() - t0) * 1000)
+
+            return r
+
+
+
+        steps = job.get("steps", [])
+
+        if not isinstance(steps, list):
+
+            r["etapes_ko"] += 1
+
+            r["statut"] = "FAIL"
+
+            r["erreur"] = "steps invalide pour " + nom_job
+
+            r["duree_ms"] = int((time.time() - t0) * 1000)
+
+            return r
+
+
+
+        for i, st in enumerate(steps):
+
+            if not isinstance(st, dict):
+
+                r["etapes_ko"] += 1
+
+                r["statut"] = "FAIL"
+
+                r["erreur"] = "step invalide " + nom_job + "#" + str(i)
+
+                r["duree_ms"] = int((time.time() - t0) * 1000)
+
+                return r
+
+
+
+            # Simule le step
+
+            nom_step = st.get("name", "step-" + str(i))
+
+            if "uses" in st:
+
+                act = str(st["uses"])
+
+                # Vérifie actions officielles connues
+
+                actions_connues = (
+
+                    "actions/checkout", "actions/setup-python",
+
+                    "actions/setup-node", "actions/setup-go",
+
+                    "actions/setup-java", "actions/cache",
+
+                    "actions/upload-artifact", "actions/download-artifact",
+
+                    "docker/build-push-action", "docker/login-action",
+
+                    "docker/setup-buildx-action", "docker/setup-qemu-action",
+
+                    "github/codeql-action", "codecov/codecov-action",
+
+                )
+
+                if not any(act.startswith(a) for a in actions_connues):
+
+                    # Action inconnue — avertissement mais pas fail
+
+                    r["log"].append("[WARN] " + nom_job + "#" + str(i) + " : action " + act + " non reconnue")
+
+                r["etapes_ok"] += 1
+
+                r["log"].append("[OK]   " + nom_job + "#" + str(i) + " : " + act)
+
+
+
+            elif "run" in st:
+
+                cmd = str(st["run"])
+
+                # Simule l'exécution : vérifie cohérence des commandes
+
+                if not cmd.strip():
+
+                    r["etapes_ko"] += 1
+
+                    r["statut"] = "FAIL"
+
+                    r["erreur"] = "step " + nom_job + "#" + str(i) + " : commande vide"
+
+                    r["duree_ms"] = int((time.time() - t0) * 1000)
+
+                    return r
+
+
+
+                # Détecte les commandes qui échouent souvent
+
+                if "npm install" in cmd and "package.json" not in str(data):
+
+                    r["log"].append("[WARN] " + nom_job + "#" + str(i) + " : npm install sans package.json")
+
+                if "pip install" in cmd and "requirements.txt" not in cmd and "-r" in cmd:
+
+                    r["log"].append("[WARN] " + nom_job + "#" + str(i) + " : requirements.txt introuvable")
+
+
+
+                r["etapes_ok"] += 1
+
+                r["log"].append("[OK]   " + nom_job + "#" + str(i) + " : run (" + str(len(cmd)) + " chars)")
+
+
+
+            time.sleep(0.01)  # Simule latence par step
+
+
+
+    r["duree_ms"] = int((time.time() - t0) * 1000)
+
+    return r
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# GITHUB API
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+GH_UA = "NexusYamlVerifier/" + VERSION
+
+
+
+
+
+def gh_api(path, token=None):
+
+    url = "https://api.github.com" + path
+
+    h = {"User-Agent": GH_UA, "Accept": "application/vnd.github+json"}
+
+    if token:
+
+        h["Authorization"] = "Bearer " + token
+
+    try:
+
+        req = urllib.request.Request(url, headers=h)
+
+        ctx = ssl.create_default_context()
+
+        ctx.check_hostname = False
+
+        ctx.verify_mode = ssl.CERT_NONE
+
+        with urllib.request.urlopen(req, timeout=20, context=ctx) as r:
+
+            return {"ok": True, "data": json.loads(r.read().decode("utf-8", "ignore"))}
+
+    except urllib.error.HTTPError as e:
+
+        return {"ok": False, "status": e.code, "err": "HTTP " + str(e.code)}
+
+    except Exception as e:
+
+        return {"ok": False, "status": 0, "err": str(e)[:150]}
+
+
+
+
+
+def gh_list_workflows(repo, token=None):
+
+    """Liste les workflows d'un repo GitHub."""
+
+    r = gh_api("/repos/" + repo + "/contents/.github/workflows", token=token)
+
+    if not r.get("ok"):
+
+        return {"ok": False, "err": r.get("err", "?")}
+
+    items = r["data"]
+
+    if not isinstance(items, list):
+
+        return {"ok": False, "err": "réponse inattendue"}
+
+    out = []
+
+    for it in items:
+
+        if it.get("type") == "file" and it.get("name", "").endswith((".yml", ".yaml")):
+
+            out.append({
+
+                "name": it["name"],
+
+                "path": it["path"],
+
+                "size": it.get("size", 0),
+
+                "sha": it.get("sha", "")[:12],
+
+                "download_url": it.get("download_url", ""),
+
+            })
+
+    return {"ok": True, "workflows": out}
+
+
+
+
+
+def gh_fetch_workflow(repo, path, token=None):
+
+    """Récupère le contenu d'un workflow."""
+
+    r = gh_api("/repos/" + repo + "/contents/" + path, token=token)
+
+    if not r.get("ok"):
+
+        return {"ok": False, "err": r.get("err", "?")}
+
+    item = r["data"]
+
+    if item.get("encoding") == "base64":
+
+        try:
+
+            content = base64.b64decode(item["content"]).decode("utf-8", "ignore")
+
+        except Exception as e:
+
+            return {"ok": False, "err": "decode err : " + str(e)[:100]}
+
+    else:
+
+        content = item.get("content", "")
+
+    return {"ok": True, "content": content, "size": item.get("size", 0)}
+
+
+
+
+
+def gh_fetch_repo(repo, token=None):
+
+    """Récupère les infos d'un repo."""
+
+    r = gh_api("/repos/" + repo, token=token)
+
+    if not r.get("ok"):
+
+        return {"ok": False, "err": r.get("err", "?")}
+
+    d = r["data"]
+
+    return {
+
+        "ok": True,
+
+        "repo": {
+
+            "full_name": d.get("full_name", ""),
+
+            "description": d.get("description", ""),
+
+            "stars": d.get("stargazers_count", 0),
+
+            "forks": d.get("forks_count", 0),
+
+            "language": d.get("language", ""),
+
+            "url": d.get("html_url", ""),
+
+            "default_branch": d.get("default_branch", "main"),
+
+        },
+
+    }
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# IMPORT base64 + ssl (nécessaires pour GH)
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+import base64
+
+import ssl
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ANALYSE UNIFIÉE (source locale OU GitHub)
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+def analyser_contenu(contenu, source, chemin, nom, key):
+
+    """Analyse complète : syntaxe + workflow + simulation run."""
+
+    r = {
+
+        "source": source, "chemin": chemin, "nom": nom,
+
+        "taille": len(contenu), "lignes": contenu.count("\n") + 1,
+
+        "hash_sha256": hashlib.sha256(contenu.encode("utf-8")).hexdigest(),
+
+        "valide_syntaxe": 0, "erreur_syntaxe": "",
+
+        "est_workflow": 1 if (".github/workflows" in chemin or source == "github") else 0,
+
+        "score": 0, "probleme": [], "avertissement": [], "info": [],
+
+        "run_statut": "", "run_erreur": "", "run_ms": 0,
+
+    }
+
+    v = valider_yaml(contenu)
+
+    if not v["valide"]:
+
+        r["erreur_syntaxe"] = v["erreur"] or ""
+
+        r["probleme"].append("Syntaxe : " + str(v["erreur"]))
+
+        return r
+
+    r["valide_syntaxe"] = 1
+
+    if r["est_workflow"] and isinstance(v["data"], dict):
+
+        wf = verifier_workflow(v["data"])
+
+        r["score"] = wf["score"]
+
+        r["probleme"] = wf["problemes"]
+
+        r["avertissement"] = wf["avertissements"]
+
+        r["info"] = wf["infos"]
+
+        # Simulation runtime
+
+        run = simuler_run(v["data"])
+
+        r["run_statut"] = run["statut"]
+
+        r["run_erreur"] = run["erreur"]
+
+        r["run_ms"] = run["duree_ms"]
+
+        r["info"].append("Run : " + run["statut"] + " en " + str(run["run_ms"]) + "ms")
+
+        r["info"].append("Steps : " + str(run["etapes_ok"]) + " OK / " + str(run["etapes_ko"]) + " KO")
+
+    else:
+
+        r["score"] = 100
+
+    sig_data = (r["hash_sha256"] + "|" + r["nom"] + "|" + str(r["score"])).encode()
+
+    r["signature_hmac"] = signer(sig_data, key)
+
+    r["etat_verification"] = "Verified" if r["valide_syntaxe"] else "Non vérifié"
+
+    return r
+
+
+
+
+
+def sauver_resultat(conn, r):
+
+    cur = conn.cursor()
+
+    cur.execute("""
+
+        INSERT OR REPLACE INTO fichiers
+
+        (source, chemin, nom, taille, lignes, hash_sha256, signature_hmac,
+
+         etat_verification, valide_syntaxe, erreur_syntaxe,
+
+         est_workflow, score, probleme, avertissement, info,
+
+         duree_ms, run_statut, run_erreur, run_ms, date_scan)
+
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+
+    """, (
+
+        r["source"], r["chemin"], r["nom"], r["taille"], r["lignes"],
+
+        r["hash_sha256"], r.get("signature_hmac", ""),
+
+        r.get("etat_verification", "Non vérifié"),
+
+        r["valide_syntaxe"], r["erreur_syntaxe"], r["est_workflow"],
+
+        r["score"],
+
+        json.dumps(r["probleme"], ensure_ascii=False),
+
+        json.dumps(r["avertissement"], ensure_ascii=False),
+
+        json.dumps(r["info"], ensure_ascii=False),
+
+        r.get("run_ms", 0), r.get("run_statut", ""), r.get("run_erreur", ""),
+
+        r.get("run_ms", 0),
+
+        datetime.now(timezone.utc).isoformat(),
+
+    ))
+
+    if r.get("run_statut"):
+
+        cur.execute("""
+
+            INSERT INTO runs (source, chemin, nom, contenu_hash, statut,
+
+                              duree_ms, erreur, etapes_ok, etapes_ko, date_run)
+
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+
+        """, (
+
+            r["source"], r["chemin"], r["nom"], r["hash_sha256"],
+
+            r["run_statut"], r["run_ms"], r.get("run_erreur", ""),
+
+            0, 0, datetime.now(timezone.utc).isoformat(),
+
+        ))
+
+    conn.commit()
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# DASHBOARD HTML
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+HTML_PAGE = r"""<!DOCTYPE html>
+
+<html lang="fr">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport" content="width=device-width,initial-scale=1">
+
+<title>⚡ NEXUS YAML VERIFIER v4</title>
+
+<style>
+
+*{margin:0;padding:0;box-sizing:border-box}
+
+:root{
+
+--c1:#00d4ff;--c2:#a855f7;--c3:#c8a45c;--c4:#ff6ec7;
+
+--ok:#4ade80;--err:#f87171;--warn:#fbbf24;
+
+--bg:#02040a;--card:#0a1018;--border:#1a2540;--text:#e0e8f0;--dim:#6a7a8a;
+
+--mono:ui-monospace,Menlo,monospace;
+
+--sans:-apple-system,BlinkMacSystemFont,'Inter',system-ui,sans-serif;
+
+}
+
+body{background:var(--bg);color:var(--text);font-family:var(--sans);min-height:100vh;padding:24px;
+
+background-image:
+
+radial-gradient(ellipse at 15% 15%,rgba(0,212,255,.15) 0,transparent 55%),
+
+radial-gradient(ellipse at 85% 85%,rgba(168,85,247,.15) 0,transparent 55%)}
+
+.wrap{max-width:1200px;margin:0 auto}
+
+header{text-align:center;margin-bottom:24px}
+
+header h1{font-size:30px;font-weight:900;letter-spacing:-1.5px;
+
+background:linear-gradient(110deg,#fff 10%,var(--c1) 40%,var(--c2) 70%,var(--c4));
+
+-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
+
+filter:drop-shadow(0 0 30px rgba(0,212,255,.4))}
+
+header p{color:var(--dim);font-size:11px;letter-spacing:3px;text-transform:uppercase;margin-top:6px}
+
+.card{background:rgba(10,16,24,.7);backdrop-filter:blur(20px);
+
+border:1px solid var(--border);border-radius:14px;padding:20px;margin-bottom:14px}
+
+.card h3{font-size:11px;letter-spacing:2px;color:var(--c1);text-transform:uppercase;
+
+margin-bottom:14px;display:flex;align-items:center;gap:8px}
+
+.card h3 .pill{background:rgba(0,212,255,.15);padding:2px 8px;border-radius:10px;font-size:10px}
+
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+
+.stat{background:rgba(0,212,255,.04);border:1px solid rgba(0,212,255,.12);
+
+border-radius:10px;padding:14px}
+
+.stat .k{color:var(--dim);font-size:10px;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px}
+
+.stat .v{font-size:24px;font-weight:800;color:var(--c1);font-family:var(--mono)}
+
+.stat.green .v{color:var(--ok)}
+
+.stat.red .v{color:var(--err)}
+
+.stat.gold .v{color:var(--c3)}
+
+.stat.pink .v{color:var(--c4)}
+
+.row{display:flex;justify-content:space-between;padding:6px 0;
+
+font-family:var(--mono);font-size:12px;border-bottom:1px solid rgba(255,255,255,.04);gap:10px}
+
+.row:last-child{border:none}
+
+.row .k{color:var(--dim)}
+
+.row .v{color:var(--c1);font-weight:600;word-break:break-all}
+
+.row .v.ok{color:var(--ok)}
+
+.row .v.err{color:var(--err)}
+
+.row .v.warn{color:var(--warn)}
+
+.form{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+
+input,textarea,button,select{font-family:var(--mono);font-size:12px;
+
+padding:10px 12px;border-radius:8px;border:1px solid var(--border);
+
+background:rgba(0,0,0,.4);color:var(--text);outline:none;transition:all .15s}
+
+input:focus,textarea:focus{border-color:var(--c1)}
+
+input[type="text"]{flex:1;min-width:200px}
+
+textarea{width:100%;min-height:200px;resize:vertical;line-height:1.6}
+
+button{background:linear-gradient(135deg,var(--c1),var(--c2));
+
+color:#000;font-weight:700;cursor:pointer;border:none}
+
+button:hover{opacity:.9}
+
+button.sec{background:rgba(255,255,255,.08);color:var(--text)}
+
+.pill{display:inline-block;padding:2px 8px;border-radius:10px;
+
+font-family:var(--mono);font-size:10px;margin-right:4px;
+
+background:rgba(0,212,255,.13);color:var(--c1)}
+
+.pill.g{background:rgba(74,222,128,.13);color:var(--ok)}
+
+.pill.r{background:rgba(248,113,113,.13);color:var(--err)}
+
+.pill.y{background:rgba(251,191,36,.13);color:var(--warn)}
+
+.pill.p{background:rgba(168,85,247,.13);color:var(--c2)}
+
+pre{background:rgba(0,0,0,.5);padding:12px;border-radius:8px;color:#a5f3fc;
+
+font-family:var(--mono);font-size:11px;overflow-x:auto;white-space:pre-wrap;
+
+word-break:break-word;border-left:2px solid var(--c1);max-height:300px;overflow-y:auto}
+
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+
+@media(max-width:800px){.grid2{grid-template-columns:1fr}}
+
+footer{text-align:center;color:var(--dim);font-size:10px;
+
+margin-top:32px;font-family:var(--mono);letter-spacing:1px}
+
+footer b{color:var(--c1)}
+
+.pulse{width:8px;height:8px;border-radius:50%;background:var(--ok);
+
+box-shadow:0 0 8px var(--ok);animation:pulse 1.5s infinite}
+
+@keyframes pulse{50%{opacity:.4}}
+
+.result{display:none;margin-top:14px}
+
+.result.on{display:block}
+
+.rline{padding:6px 10px;margin-bottom:4px;border-radius:6px;
+
+border-left:3px solid var(--dim);background:rgba(255,255,255,.02);
+
+font-family:var(--mono);font-size:11px}
+
+.rline.ok{border-left-color:var(--ok);color:var(--ok)}
+
+.rline.err{border-left-color:var(--err);color:var(--err)}
+
+.rline.warn{border-left-color:var(--warn);color:var(--warn)}
+
+.rline.info{border-left-color:var(--c1);color:var(--c1)}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="wrap">
+
+
+
+<header>
+
+  <h1>⚡ NEXUS YAML VERIFIER v4</h1>
+
+  <p>v__VERSION__ · Aissa Mohammedi (DGK) · GitHub API + Runtime Test</p>
+
+</header>
+
+
+
+<!-- ═══════════ GITHUB REPO ═══════════ -->
+
+<div class="card">
+
+  <h3>🔗 GitHub Repository</h3>
+
+  <div class="form">
+
+    <input type="text" id="repo-input" placeholder="owner/repo (ex: Aissamohammedi88/Nexus-id)">
+
+    <button onclick="fetchRepo()">📥 Charger</button>
+
+    <button class="sec" onclick="listWorkflows()">📋 Workflows</button>
+
+    <button class="sec" onclick="testAllWorkflows()">▶ Tester tous</button>
+
+  </div>
+
+  <div id="repo-info"></div>
+
+</div>
+
+
+
+<!-- ═══════════ YAML MANUEL ═══════════ -->
+
+<div class="card">
+
+  <h3>✍️ Coller un YAML</h3>
+
+  <textarea id="yaml-input" placeholder="Colle ton workflow .yml ici..."></textarea>
+
+  <div class="form" style="margin-top:10px">
+
+    <button onclick="evaluerYaml()">▶ Évaluer + Tester</button>
+
+    <button class="sec" onclick="document.getElementById('yaml-input').value=''">✕ Effacer</button>
+
+  </div>
+
+  <div class="result" id="yaml-result"></div>
+
+</div>
+
+
+
+<!-- ═══════════ STATS ═══════════ -->
+
+<div class="card">
+
+  <h3><span class="pulse"></span>État du scan <span class="pill" id="status-pill">idle</span></h3>
+
+  <div class="stats">
+
+    <div class="stat"><div class="k">Total</div><div class="v" id="total">0</div></div>
+
+    <div class="stat green"><div class="k">Valides</div><div class="v" id="valides">0</div></div>
+
+    <div class="stat red"><div class="k">Invalides</div><div class="v" id="invalides">0</div></div>
+
+    <div class="stat gold"><div class="k">Workflows</div><div class="v" id="workflows">0</div></div>
+
+    <div class="stat pink"><div class="k">Runs OK</div><div class="v" id="runs-ok">0</div></div>
+
+    <div class="stat red"><div class="k">Runs FAIL</div><div class="v" id="runs-fail">0</div></div>
+
+  </div>
+
+</div>
+
+
+
+<!-- ═══════════ RESULTATS WORKFLOWS ═══════════ -->
+
+<div class="card">
+
+  <h3>📊 Résultats workflows</h3>
+
+  <div id="workflow-results"><div style="color:var(--dim);font-family:var(--mono);font-size:12px">Charge un repo GitHub ou colle un YAML.</div></div>
+
+</div>
+
+
+
+<!-- ═══════════ LOG ═══════════ -->
+
+<div class="card">
+
+  <h3>📜 Log en direct</h3>
+
+  <pre id="log">—</pre>
+
+</div>
+
+
+
+<footer>
+
+  NEXUS YAML VERIFIER · <b>Aissa Mohammedi (DGK)</b> · NEXUS-OPEN-2.0
+
+</footer>
+
+
+
+</div>
+
+
+
+<script>
+
+function esc(s) {
+
+  const d = document.createElement('div');
+
+  d.textContent = s == null ? '' : String(s);
+
+  return d.innerHTML;
+
+}
+
+function fmtMs(ms) {
+
+  if (ms < 1000) return ms + ' ms';
+
+  return (ms / 1000).toFixed(2) + ' s';
+
+}
+
+function badge(status) {
+
+  if (status === 'SUCCESS') return '<span class="pill g">SUCCESS</span>';
+
+  if (status === 'FAIL') return '<span class="pill r">FAIL</span>';
+
+  return '<span class="pill y">' + esc(status) + '</span>';
+
+}
+
+
+
+async function api(url, body) {
+
+  const opts = body ? {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)} : {};
+
+  try {
+
+    const r = await fetch(url, opts);
+
+    return await r.json();
+
+  } catch(e) { return {ok:false, err:e.message}; }
+
+}
+
+
+
+async function fetchRepo() {
+
+  const repo = document.getElementById('repo-input').value.trim();
+
+  if (!repo) return;
+
+  const info = document.getElementById('repo-info');
+
+  info.innerHTML = '<div class="row"><span class="k">Chargement…</span></div>';
+
+  const r = await api('/api/repo?repo=' + encodeURIComponent(repo));
+
+  if (!r.ok) { info.innerHTML = '<div class="row"><span class="v err">Erreur : ' + esc(r.err) + '</span></div>'; return; }
+
+  const d = r.repo;
+
+  info.innerHTML =
+
+    '<div class="row"><span class="k">Nom</span><span class="v">' + esc(d.full_name) + '</span></div>' +
+
+    '<div class="row"><span class="k">Description</span><span class="v">' + esc(d.description) + '</span></div>' +
+
+    '<div class="row"><span class="k">Stars</span><span class="v ok">' + d.stars + ' ★</span></div>' +
+
+    '<div class="row"><span class="k">Forks</span><span class="v">' + d.forks + '</span></div>' +
+
+    '<div class="row"><span class="k">Langage</span><span class="v">' + esc(d.language) + '</span></div>' +
+
+    '<div class="row"><span class="k">URL</span><span class="v"><a href="' + esc(d.url) + '" target="_blank" style="color:var(--c1)">' + esc(d.url) + '</a></span></div>';
+
+}
+
+
+
+async function listWorkflows() {
+
+  const repo = document.getElementById('repo-input').value.trim();
+
+  if (!repo) { alert('Entrer un repo'); return; }
+
+  const el = document.getElementById('workflow-results');
+
+  el.innerHTML = '<div style="color:var(--dim);font-family:var(--mono);font-size:12px">Chargement workflows…</div>';
+
+  const r = await api('/api/workflows?repo=' + encodeURIComponent(repo));
+
+  if (!r.ok) { el.innerHTML = '<div style="color:var(--err);font-family:var(--mono);font-size:12px">Erreur : ' + esc(r.err) + '</div>'; return; }
+
+  if (!r.workflows.length) { el.innerHTML = '<div style="color:var(--dim);font-family:var(--mono);font-size:12px">Aucun workflow.</div>'; return; }
+
+  el.innerHTML = r.workflows.map(w =>
+
+    '<div class="row"><span class="k">' + esc(w.name) + '</span>' +
+
+    '<span class="v">' + w.size + ' o · <a href="' + esc(w.download_url) + '" target="_blank" style="color:var(--c1)">open</a></span></div>'
+
+  ).join('');
+
+}
+
+
+
+async function testAllWorkflows() {
+
+  const repo = document.getElementById('repo-input').value.trim();
+
+  if (!repo) { alert('Entrer un repo'); return; }
+
+  const el = document.getElementById('workflow-results');
+
+  el.innerHTML = '<div style="color:var(--c1);font-family:var(--mono);font-size:12px">▶ Test de tous les workflows…</div>';
+
+  const r = await api('/api/test-all?repo=' + encodeURIComponent(repo));
+
+  if (!r.ok) { el.innerHTML = '<div style="color:var(--err)">Erreur : ' + esc(r.err) + '</div>'; return; }
+
+  renderResults(r.results);
+
+}
+
+
+
+function renderResults(list) {
+
+  const el = document.getElementById('workflow-results');
+
+  el.innerHTML = list.map(r => {
+
+    const cls = r.run_statut === 'SUCCESS' ? 'ok' : 'err';
+
+    const dur = fmtMs(r.run_ms);
+
+    let html = '<div style="border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:10px">';
+
+    html += '<div class="row"><span class="k">' + esc(r.nom) + '</span>';
+
+    html += '<span class="v">' + badge(r.run_statut) + ' · ' + dur + '</span></div>';
+
+    html += '<div class="row"><span class="k">Chemin</span><span class="v">' + esc(r.chemin) + '</span></div>';
+
+    html += '<div class="row"><span class="k">Score</span><span class="v">' + r.score + '/100</span></div>';
+
+    html += '<div class="row"><span class="k">SHA-256</span><span class="v">' + r.hash_sha256.slice(0,16) + '…</span></div>';
+
+    if (r.run_erreur) html += '<div class="row"><span class="k">Erreur</span><span class="v err">' + esc(r.run_erreur) + '</span></div>';
+
+    if (r.probleme && r.probleme.length) html += '<div class="row"><span class="k">Problèmes</span><span class="v err">' + r.probleme.length + '</span></div>';
+
+    if (r.avertissement && r.avertissement.length) html += '<div class="row"><span class="k">Avertissements</span><span class="v warn">' + r.avertissement.length + '</span></div>';
+
+    html += '</div>';
+
+    return html;
+
+  }).join('');
+
+}
+
+
+
+async function evaluerYaml() {
+
+  const yaml = document.getElementById('yaml-input').value;
+
+  if (!yaml.trim()) { alert('Colle un YAML'); return; }
+
+  const el = document.getElementById('yaml-result');
+
+  el.className = 'result on';
+
+  el.innerHTML = '<div class="rline info">Analyse…</div>';
+
+  const r = await api('/api/eval', {yaml: yaml});
+
+  if (!r.ok) { el.innerHTML = '<div class="rline err">Erreur : ' + esc(r.err) + '</div>'; return; }
+
+  const d = r.result;
+
+  let html = '';
+
+  html += '<div class="rline ' + (d.valide_syntaxe ? 'ok' : 'err') + '">Syntaxe : ' + (d.valide_syntaxe ? 'OK' : 'KO ' + esc(d.erreur_syntaxe)) + '</div>';
+
+  if (d.est_workflow) {
+
+    html += '<div class="rline info">Workflow : score ' + d.score + '/100</div>';
+
+    html += '<div class="rline ' + (d.run_statut === 'SUCCESS' ? 'ok' : 'err') + '">Run : ' + badge(d.run_statut) + ' en ' + fmtMs(d.run_ms) + '</div>';
+
+    if (d.run_erreur) html += '<div class="rline err">Erreur run : ' + esc(d.run_erreur) + '</div>';
+
+    d.info.forEach(i => html += '<div class="rline info">' + esc(i) + '</div>');
+
+    d.probleme.forEach(p => html += '<div class="rline err">✗ ' + esc(p) + '</div>');
+
+    d.avertissement.forEach(a => html += '<div class="rline warn">⚠ ' + esc(a) + '</div>');
+
+  } else {
+
+    html += '<div class="rline info">Fichier YAML valide (non-workflow)</div>';
+
+  }
+
+  html += '<div class="rline info">SHA-256 : ' + d.hash_sha256.slice(0,32) + '…</div>';
+
+  el.innerHTML = html;
+
+}
+
+
+
+async function refresh() {
+
+  const d = await api('/api/state');
+
+  document.getElementById('total').textContent = d.total || 0;
+
+  document.getElementById('valides').textContent = d.valides || 0;
+
+  document.getElementById('invalides').textContent = d.invalides || 0;
+
+  document.getElementById('workflows').textContent = d.workflows || 0;
+
+  document.getElementById('runs-ok').textContent = (d.runs || []).filter(r => r.statut === 'SUCCESS').length;
+
+  document.getElementById('runs-fail').textContent = (d.runs || []).filter(r => r.statut === 'FAIL').length;
+
+  document.getElementById('status-pill').textContent = d.running ? 'running' : 'idle';
+
+
+
+  const lg = d.log || [];
+
+  document.getElementById('log').textContent = lg.slice(-40).reverse().map(l =>
+
+    new Date(l.ts * 1000).toLocaleTimeString() + ' — ' + l.msg
+
+  ).join('\n') || '—';
+
+}
+
+
+
+refresh();
+
+setInterval(refresh, 2000);
+
+</script>
+
+</body>
+
+</html>
+
+"""
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# SERVEUR HTTP
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+class Handler(BaseHTTPRequestHandler):
+
+    server_version = "NexusYamlVerifier/" + VERSION
+
+    protocol_version = "HTTP/1.1"
+
+
+
+    def log_message(self, *a):
+
+        pass
+
+
+
+    def _send(self, code, body, ctype="text/html; charset=utf-8"):
+
+        if isinstance(body, str):
+
+            body = body.encode("utf-8")
+
+        try:
+
+            self.send_response(code)
+
+            self.send_header("Content-Type", ctype)
+
+            self.send_header("Content-Length", str(len(body)))
+
+            self.send_header("Access-Control-Allow-Origin", "*")
+
+            self.send_header("Cache-Control", "no-store")
+
+            self.end_headers()
+
+            self.wfile.write(body)
+
+        except (BrokenPipeError, ConnectionResetError):
+
+            pass
+
+
+
+    def _json(self, code, obj):
+
+        self._send(code, json.dumps(obj, indent=2, ensure_ascii=False, default=str),
+
+                   "application/json; charset=utf-8")
+
+
+
+    def do_GET(self):
+
+        p = urllib.parse.urlparse(self.path)
+
+        path = p.path
+
+        qs = urllib.parse.parse_qs(p.query)
+
+
+
+        if path in ("/", "/index.html"):
+
+            html = HTML_PAGE.replace("__VERSION__", VERSION)
+
+            return self._send(200, html)
+
+
+
+        if path == "/api/state":
+
+            return self._json(200, state_get())
+
+
+
+        if path == "/api/status":
+
+            return self._json(200, {
+
+                "ok": True, "service": "NEXUS YAML VERIFIER",
+
+                "version": VERSION, "auteur": AUTEUR,
+
+                "port": HTTP_PORT, "running": STATE["running"],
+
+            })
+
+
+
+        if path == "/api/repo":
+
+            repo = qs.get("repo", [""])[0].strip()
+
+            if not repo or "/" not in repo:
+
+                return self._json(400, {"ok": False, "err": "repo invalide (owner/name)"})
+
+            r = gh_fetch_repo(repo)
+
+            return self._json(200, r)
+
+
+
+        if path == "/api/workflows":
+
+            repo = qs.get("repo", [""])[0].strip()
+
+            if not repo or "/" not in repo:
+
+                return self._json(400, {"ok": False, "err": "repo invalide"})
+
+            r = gh_list_workflows(repo)
+
+            return self._json(200, r)
+
+
+
+        if path == "/ping":
+
+            return self._send(200, "pong")
+
+
+
+        return self._send(404, "404 — Not found")
+
+
+
+    def do_POST(self):
+
+        p = urllib.parse.urlparse(self.path)
+
+        path = p.path
+
+        qs = urllib.parse.parse_qs(p.query)
+
+
+
+        try:
+
+            length = int(self.headers.get("Content-Length", "0") or "0")
+
+            body = self.rfile.read(length).decode("utf-8", "ignore") if length else "{}"
+
+            payload = json.loads(body) if body else {}
+
+        except Exception:
+
+            payload = {}
+
+
+
+        # Évaluer un YAML manuel
+
+        if path == "/api/eval":
+
+            yaml_str = payload.get("yaml", "")
+
+            if not yaml_str.strip():
+
+                return self._json(400, {"ok": False, "err": "yaml vide"})
+
+            key = charger_ou_creer_ke()
+
+            r = analyser_contenu(yaml_str, "manual", "manual.yml", "manual.yml", key)
+
+            # Stats
+
+            state_update(total=STATE["total"] + 1)
+
+            if r["valide_syntaxe"]:
+
+                state_update(valides=STATE["valides"] + 1)
+
+            else:
+
+                state_update(invalides=STATE["invalides"] + 1)
+
+            if r["est_workflow"]:
+
+                state_update(workflows=STATE["workflows"] + 1)
+
+            with STATE_LK:
+
+                STATE.setdefault("runs", []).append({
+
+                    "nom": r["nom"], "statut": r.get("run_statut", ""),
+
+                    "ms": r.get("run_ms", 0), "ts": time.time(),
+
+                })
+
+                if len(STATE["runs"]) > 100:
+
+                    STATE["runs"] = STATE["runs"][-100:]
+
+            return self._json(200, {"ok": True, "result": r})
+
+
+
+        # Tester tous les workflows d'un repo
+
+        if path == "/api/test-all":
+
+            repo = qs.get("repo", [""])[0].strip()
+
+            if not repo or "/" not in repo:
+
+                return self._json(400, {"ok": False, "err": "repo invalide"})
+
+            return self._test_all_workflows(repo)
+
+
+
+        # Tester un workflow GitHub
+
+        if path == "/api/test-one":
+
+            repo = qs.get("repo", [""])[0].strip()
+
+            wf_path = qs.get("path", [""])[0].strip()
+
+            if not repo or not wf_path:
+
+                return self._json(400, {"ok": False, "err": "repo et path requis"})
+
+            return self._test_one_workflow(repo, wf_path)
+
+
+
+        return self._json(404, {"ok": False, "err": "not found"})
+
+
+
+    def _test_all_workflows(self, repo):
+
+        r = gh_list_workflows(repo)
+
+        if not r.get("ok"):
+
+            return self._json(200, {"ok": False, "err": r.get("err", "?")})
+
+        results = []
+
+        key = charger_ou_creer_ke()
+
+        for wf in r["workflows"]:
+
+            rr = gh_fetch_workflow(repo, wf["path"])
+
+            if not rr.get("ok"):
+
+                continue
+
+            res = analyser_contenu(rr["content"], "github", wf["path"], wf["name"], key)
+
+            results.append(res)
+
+            with STATE_LK:
+
+                STATE["total"] += 1
+
+                if res["valide_syntaxe"]:
+
+                    STATE["valides"] += 1
+
+                else:
+
+                    STATE["invalides"] += 1
+
+                if res["est_workflow"]:
+
+                    STATE["workflows"] += 1
+
+                STATE.setdefault("runs", []).append({
+
+                    "nom": res["nom"], "statut": res.get("run_statut", ""),
+
+                    "ms": res.get("run_ms", 0), "ts": time.time(),
+
+                })
+
+                if len(STATE["runs"]) > 100:
+
+                    STATE["runs"] = STATE["runs"][-100:]
+
+        return self._json(200, {"ok": True, "results": results})
+
+
+
+    def _test_one_workflow(self, repo, path):
+
+        r = gh_fetch_workflow(repo, path)
+
+        if not r.get("ok"):
+
+            return self._json(200, {"ok": False, "err": r.get("err", "?")})
+
+        key = charger_ou_creer_ke()
+
+        res = analyser_contenu(r["content"], "github", path, os.path.basename(path), key)
+
+        with STATE_LK:
+
+            STATE["total"] += 1
+
+            if res["valide_syntaxe"]:
+
+                STATE["valides"] += 1
+
+            else:
+
+                STATE["invalides"] += 1
+
+            if res["est_workflow"]:
+
+                STATE["workflows"] += 1
+
+            STATE.setdefault("runs", []).append({
+
+                "nom": res["nom"], "statut": res.get("run_statut", ""),
+
+                "ms": res.get("run_ms", 0), "ts": time.time(),
+
+            })
+
+            if len(STATE["runs"]) > 100:
+
+                STATE["runs"] = STATE["runs"][-100:]
+
+        return self._json(200, {"ok": True, "result": res})
+
+
+
+
+
+def charger_ou_creer_ke():
+
+    """Alias safe pour éviter conflit de nom avec `key` (variable)."""
+
+    return charger_ou_creer_cle()
+
+
+
+
+
+class Server(ThreadingMixIn, HTTPServer):
+
+    daemon_threads = True
+
+    allow_reuse_address = True
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# MAIN
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+def ip_lan():
+
+    try:
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        s.connect(("8.8.8.8", 80))
+
+        ip = s.getsockname()[0]
+
+        s.close()
+
+        return ip
+
+    except Exception:
+
+        return "127.0.0.1"
+
+
+
+
+
+def main():
+
+    parser = argparse.ArgumentParser(description="Nexus YAML Verifier v4")
+
+    parser.add_argument("--port", type=int, default=HTTP_PORT)
+
+    parser.add_argument("--host", default="0.0.0.0")
+
+    args = parser.parse_args()
+
+
+
+    init_db()
+
+    key = charger_ou_creer_cle()
+
+
+
+    print("")
+
+    print(M + "=" * 70 + N)
+
+    print(M + "  NEXUS YAML VERIFIER v" + VERSION + N)
+
+    print(M + "  Auteur : " + AUTEUR + "  |  Licence : " + LICENCE + N)
+
+    print(M + "=" * 70 + N)
+
+    print()
+
+    print("  🌐 Local  : http://localhost:" + str(args.port) + "/")
+
+    print("  🌐 Réseau : http://" + ip_lan() + ":" + str(args.port) + "/")
+
+    print()
+
+    print("  Fonctionnalités :")
+
+    print("    • Charger un repo GitHub (owner/repo)")
+
+    print("    • Lister les workflows .yml du repo")
+
+    print("    • Tester tous les workflows (score + run + durée)")
+
+    print("    • Coller un YAML manuel et l'évaluer en direct")
+
+    print("    • Simulation runtime : succès / échec + durée en ms")
+
+    print()
+
+    print("  API REST :")
+
+    print("    GET  /api/repo?repo=owner/name")
+
+    print("    GET  /api/workflows?repo=owner/name")
+
+    print("    POST /api/eval {yaml}")
+
+    print("    POST /api/test-all?repo=owner/name")
+
+    print("    POST /api/test-one?repo=owner/name&path=.github/workflows/x.yml")
+
+    print("    GET  /api/state")
+
+    print()
+
+    print("  Ctrl+C pour arrêter")
+
+    print()
+
+
+
+    try:
+
+        srv = Server((args.host, args.port), Handler)
+
+        srv.serve_forever()
+
+    except KeyboardInterrupt:
+
+        print()
+
+        print("  Arrêté.")
+
+        print()
+
+    except OSError as e:
+
+        print("  Erreur port " + str(args.port) + " : " + str(e))
+
+
+
+
+
+if __name__ == "__main__":
+
+    try:
+
+        main()
+
+    except KeyboardInterrupt:
+
+        print()
+
+        print("  Interrompu.")
+
+        sys.exit(130)
